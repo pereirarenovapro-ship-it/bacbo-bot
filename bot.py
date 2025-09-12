@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
+    ContextTypes, filters, Application
 )
 
 # =================== Persistência ===================
@@ -62,13 +62,11 @@ def ensure_cooldown(p: Profile) -> Optional[int]:
     return rem if rem > 0 else None
 
 def kelly_fraction(p: float, b: float = 1.0) -> float:
-    # Kelly para payout 1:1
     q = 1 - p
     f = (b*p - q) / b
     return max(0.0, min(1.0, f))
 
 def advisor_suggestion(p: Profile) -> str:
-    # usa apenas probabilidades definidas pelo utilizador
     m_best, prob = max([(m, p.probs.get(m,0.5)) for m in ("dragon","tiger")], key=lambda x: x[1])
     f = kelly_fraction(prob, b=1.0)
     if prob <= 0.5 or f <= 0:
@@ -234,13 +232,12 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =================== AUTO (JobQueue) ===================
 def _cancel_jobs_for(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    # usar job_queue do application
     for j in context.application.job_queue.get_jobs_by_name(f"auto-{chat_id}"):
         j.schedule_removal()
 
 async def auto_tick(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
-    uid = chat_id  # para chats 1:1 funciona bem
+    uid = chat_id
     p = Profile.load(uid)
     rem = ensure_cooldown(p)
     pnl_s = session_pnl(p)
@@ -250,7 +247,7 @@ async def auto_tick(context: ContextTypes.DEFAULT_TYPE):
     if p.stop_win and pnl_s >= abs(p.stop_win):
         await context.bot.send_message(chat_id, "✅ Objetivo de lucro atingido. Auto desligado.")
         _cancel_jobs_for(chat_id, context); p.auto_enabled = False; p.save(uid); return
-    if rem:  # respeita cooldown
+    if rem:
         return
     await context.bot.send_message(chat_id, advisor_suggestion(p))
 
@@ -282,14 +279,17 @@ async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Não reconheço esse comando. Use /help.")
 
 # =================== Main ===================
+async def post_init(application: Application):
+    # garante que NÃO existe webhook configurado (senão conflita com polling)
+    await application.bot.delete_webhook(drop_pending_updates=True)
+
 def main():
     load_dotenv()
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN não definido. Configure no Render (Environment).")
-    app = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(token).post_init(post_init).build()
 
-    # Comandos
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("setbankroll", setbankroll))
@@ -306,7 +306,7 @@ def main():
     app.add_handler(CommandHandler("auto_off", auto_off))
     app.add_handler(MessageHandler(filters.COMMAND, fallback))
 
-    print("Bot a correr (Render) com auto_on/auto_off.")
+    print("Bot a correr (Render) com auto_on/auto_off. Limpando webhooks e iniciando polling…")
     app.run_polling(close_loop=False, drop_pending_updates=True)
 
 if __name__ == "__main__":
