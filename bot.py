@@ -8,10 +8,10 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, JobQueue, filters
+    ContextTypes, filters
 )
 
-# =================== Armazenamento ===================
+# =================== Persistência ===================
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
@@ -35,7 +35,7 @@ class Profile(BaseModel):
     lifetime_bets: int = 0
     lifetime_pnl: float = 0.0
     probs: Dict[str, float] = Field(default_factory=lambda: {"dragon": 0.5, "tiger": 0.5, "tie": 0.08})
-    # AUTO
+    # auto
     auto_enabled: bool = False
     auto_interval_min: int = 15
 
@@ -62,11 +62,13 @@ def ensure_cooldown(p: Profile) -> Optional[int]:
     return rem if rem > 0 else None
 
 def kelly_fraction(p: float, b: float = 1.0) -> float:
+    # Kelly para payout 1:1
     q = 1 - p
     f = (b*p - q) / b
     return max(0.0, min(1.0, f))
 
 def advisor_suggestion(p: Profile) -> str:
+    # usa apenas probabilidades definidas pelo utilizador
     m_best, prob = max([(m, p.probs.get(m,0.5)) for m in ("dragon","tiger")], key=lambda x: x[1])
     f = kelly_fraction(prob, b=1.0)
     if prob <= 0.5 or f <= 0:
@@ -74,7 +76,7 @@ def advisor_suggestion(p: Profile) -> str:
     stake = max(1.0, round(p.bankroll * f, 2))
     return f"✅ Melhor: **{m_best}** (p={prob:.3f}). Sugestão: stake ~ {fmt(stake)}. Use /cooldown e /setlimits."
 
-# =================== Handlers básicos ===================
+# =================== Handlers ===================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     prof = Profile.load(uid); prof.save(uid)
@@ -230,14 +232,15 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p.session_start = time.time(); p.bets = []; p.save(uid)
     await update.message.reply_text("Sessão reiniciada.")
 
-# =================== AUTO via JobQueue ===================
+# =================== AUTO (JobQueue) ===================
 def _cancel_jobs_for(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    for j in context.job_queue.get_jobs_by_name(f"auto-{chat_id}"):
+    # usar job_queue do application
+    for j in context.application.job_queue.get_jobs_by_name(f"auto-{chat_id}"):
         j.schedule_removal()
 
 async def auto_tick(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
-    uid = chat_id  # usamos o chat_id como uid para 1:1
+    uid = chat_id  # para chats 1:1 funciona bem
     p = Profile.load(uid)
     rem = ensure_cooldown(p)
     pnl_s = session_pnl(p)
@@ -247,7 +250,7 @@ async def auto_tick(context: ContextTypes.DEFAULT_TYPE):
     if p.stop_win and pnl_s >= abs(p.stop_win):
         await context.bot.send_message(chat_id, "✅ Objetivo de lucro atingido. Auto desligado.")
         _cancel_jobs_for(chat_id, context); p.auto_enabled = False; p.save(uid); return
-    if rem:
+    if rem:  # respeita cooldown
         return
     await context.bot.send_message(chat_id, advisor_suggestion(p))
 
@@ -263,7 +266,7 @@ async def auto_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     p.auto_enabled = True; p.auto_interval_min = minutes; p.save(uid)
     _cancel_jobs_for(chat_id, context)
-    context.job_queue.run_repeating(
+    context.application.job_queue.run_repeating(
         auto_tick, interval=minutes*60, first=0, chat_id=chat_id, name=f"auto-{chat_id}"
     )
     await update.message.reply_text(f"🔔 Auto ligado: enviarei sugestões a cada {minutes} min. Use /auto_off para parar.")
@@ -304,7 +307,7 @@ def main():
     app.add_handler(MessageHandler(filters.COMMAND, fallback))
 
     print("Bot a correr (Render) com auto_on/auto_off.")
-    app.run_polling(close_loop=False)
+    app.run_polling(close_loop=False, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
