@@ -6,8 +6,12 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, JobQueue, filters
+)
 
+# =================== Armazenamento ===================
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
@@ -31,22 +35,27 @@ class Profile(BaseModel):
     lifetime_bets: int = 0
     lifetime_pnl: float = 0.0
     probs: Dict[str, float] = Field(default_factory=lambda: {"dragon": 0.5, "tiger": 0.5, "tie": 0.08})
+    # AUTO
+    auto_enabled: bool = False
+    auto_interval_min: int = 15
 
     def save(self, uid: int):
         (DATA_DIR / f"{uid}.json").write_text(self.model_dump_json(indent=2), encoding="utf-8")
 
     @staticmethod
     def load(uid: int) -> "Profile":
-        path = DATA_DIR / f"{uid}.json"
-        if path.exists():
-            return Profile.model_validate_json(path.read_text(encoding="utf-8"))
+        p = DATA_DIR / f"{uid}.json"
+        if p.exists():
+            return Profile.model_validate_json(p.read_text(encoding="utf-8"))
         return Profile()
 
+# =================== Helpers ===================
 def fmt(x: float) -> str:
     return f"€{x:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
 
 def now() -> float: return time.time()
 def session_pnl(p: Profile) -> float: return sum(b.pnl for b in p.bets if b.pnl is not None)
+
 def ensure_cooldown(p: Profile) -> Optional[int]:
     if p.cooldown_min <= 0: return None
     rem = int(p.last_bet_ts + p.cooldown_min*60 - now())
@@ -65,6 +74,7 @@ def advisor_suggestion(p: Profile) -> str:
     stake = max(1.0, round(p.bankroll * f, 2))
     return f"✅ Melhor: **{m_best}** (p={prob:.3f}). Sugestão: stake ~ {fmt(stake)}. Use /cooldown e /setlimits."
 
+# =================== Handlers básicos ===================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     prof = Profile.load(uid); prof.save(uid)
@@ -72,9 +82,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Comandos: /setbankroll <v>, /setlimits <sl> <tp>, /cooldown <m>, "
-        "/setprob <mercado> <p>, /prob, /suggest, /bet <stake> <mercado>, "
-        "/result <win|lose|push>, /stats, /reset"
+        "Comandos:\n"
+        "/setbankroll <valor>\n"
+        "/setlimits <stop_loss> <stop_win>\n"
+        "/cooldown <min>\n"
+        "/setprob <mercado> <p 0-1>\n"
+        "/prob\n"
+        "/suggest\n"
+        "/bet <stake> <dragon|tiger|tie>\n"
+        "/result <win|lose|push>\n"
+        "/stats\n"
+        "/reset\n"
+        "/auto_on <min>  — envia sugestões automáticas a cada X minutos\n"
+        "/auto_off       — desativa envio automático"
     )
 
 async def setbankroll(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,7 +123,7 @@ async def setlimits(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cooldown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id; p = Profile.load(uid)
     if not context.args:
-        await update.message.reply_text(f"Cooldown atual: {p.cooldown_min} min. Use /cooldown <minutos>.")
+        await update.message.reply_text(f"Cooldown atual: {p.cooldown_min} min. Use /cooldown <min>.")
         return
     try:
         m = int(context.args[0]); assert m>=0
@@ -210,15 +230,63 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p.session_start = time.time(); p.bets = []; p.save(uid)
     await update.message.reply_text("Sessão reiniciada.")
 
+# =================== AUTO via JobQueue ===================
+def _cancel_jobs_for(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    for j in context.job_queue.get_jobs_by_name(f"auto-{chat_id}"):
+        j.schedule_removal()
+
+async def auto_tick(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    uid = chat_id  # usamos o chat_id como uid para 1:1
+    p = Profile.load(uid)
+    rem = ensure_cooldown(p)
+    pnl_s = session_pnl(p)
+    if p.stop_loss and pnl_s <= -abs(p.stop_loss):
+        await context.bot.send_message(chat_id, "🛑 Stop-loss atingido. Auto desligado.")
+        _cancel_jobs_for(chat_id, context); p.auto_enabled = False; p.save(uid); return
+    if p.stop_win and pnl_s >= abs(p.stop_win):
+        await context.bot.send_message(chat_id, "✅ Objetivo de lucro atingido. Auto desligado.")
+        _cancel_jobs_for(chat_id, context); p.auto_enabled = False; p.save(uid); return
+    if rem:
+        return
+    await context.bot.send_message(chat_id, advisor_suggestion(p))
+
+async def auto_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id
+    p = Profile.load(uid)
+    try:
+        minutes = int(context.args[0]) if context.args else p.auto_interval_min
+        assert minutes >= 1
+    except Exception:
+        await update.message.reply_text("Uso: /auto_on <minutos>  (ex.: /auto_on 5)")
+        return
+    p.auto_enabled = True; p.auto_interval_min = minutes; p.save(uid)
+    _cancel_jobs_for(chat_id, context)
+    context.job_queue.run_repeating(
+        auto_tick, interval=minutes*60, first=0, chat_id=chat_id, name=f"auto-{chat_id}"
+    )
+    await update.message.reply_text(f"🔔 Auto ligado: enviarei sugestões a cada {minutes} min. Use /auto_off para parar.")
+
+async def auto_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id
+    _cancel_jobs_for(chat_id, context)
+    p = Profile.load(uid); p.auto_enabled = False; p.save(uid)
+    await update.message.reply_text("🔕 Auto desligado.")
+
 async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Não reconheço esse comando. Use /help.")
 
+# =================== Main ===================
 def main():
     load_dotenv()
     token = os.getenv("BOT_TOKEN")
     if not token:
-        raise RuntimeError("BOT_TOKEN não definido. Crie um .env no Render.")
+        raise RuntimeError("BOT_TOKEN não definido. Configure no Render (Environment).")
     app = ApplicationBuilder().token(token).build()
+
+    # Comandos
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("setbankroll", setbankroll))
@@ -231,8 +299,11 @@ def main():
     app.add_handler(CommandHandler("result", result_cmd))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CommandHandler("auto_on", auto_on))
+    app.add_handler(CommandHandler("auto_off", auto_off))
     app.add_handler(MessageHandler(filters.COMMAND, fallback))
-    print("Bot a correr (Render).")
+
+    print("Bot a correr (Render) com auto_on/auto_off.")
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
