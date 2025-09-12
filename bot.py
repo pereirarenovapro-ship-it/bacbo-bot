@@ -280,7 +280,7 @@ async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =================== Main ===================
 async def post_init(application: Application):
-    # garante que NÃO existe webhook configurado (senão conflita com polling)
+    # remove qualquer webhook antigo para evitar conflito com polling
     await application.bot.delete_webhook(drop_pending_updates=True)
 
 def main():
