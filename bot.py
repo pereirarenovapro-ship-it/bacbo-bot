@@ -11,7 +11,9 @@ from telegram.ext import (
     ContextTypes, filters, Application
 )
 
-# =============== Persistência por utilizador ===============
+# =========================================================
+# Persistência por utilizador (ficheiro JSON em ./data)
+# =========================================================
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
@@ -246,7 +248,10 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =================== AUTO (JobQueue) ===================
 def _cancel_jobs_for(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    for j in context.application.job_queue.get_jobs_by_name(f"auto-{chat_id}"):
+    jq = getattr(context, "job_queue", None)
+    if not jq:
+        return
+    for j in jq.get_jobs_by_name(f"auto-{chat_id}"):
         j.schedule_removal()
 
 async def auto_tick(context: ContextTypes.DEFAULT_TYPE):
@@ -278,7 +283,9 @@ async def auto_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     p.auto_enabled = True; p.auto_interval_min = minutes; p.save(uid)
     _cancel_jobs_for(chat_id, context)
-    context.application.job_queue.run_repeating(
+
+    jq = context.job_queue  # <— usa o job_queue correto (evita NoneType)
+    jq.run_repeating(
         auto_tick, interval=minutes*60, first=0, chat_id=chat_id, name=f"auto-{chat_id}"
     )
     await update.message.reply_text(f"🔔 Auto ligado: enviarei sugestões a cada {minutes} min. Use /auto_off para parar.")
