@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, time
+import os, time, logging
 from typing import Dict, List, Optional
 from pathlib import Path
 
@@ -11,9 +11,14 @@ from telegram.ext import (
     ContextTypes, filters, Application
 )
 
-# =========================================================
-# Persistência por utilizador (ficheiro JSON em ./data)
-# =========================================================
+# ----------------- LOGGING -----------------
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("bacbo-bot")
+
+# --------------- PERSISTÊNCIA --------------
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
@@ -51,7 +56,7 @@ class Profile(BaseModel):
             return Profile.model_validate_json(p.read_text(encoding="utf-8"))
         return Profile()
 
-# =================== Helpers ===================
+# ----------------- HELPERS ------------------
 def fmt(x: float) -> str:
     return f"€{x:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
 
@@ -64,18 +69,12 @@ def ensure_cooldown(p: Profile) -> Optional[int]:
     return rem if rem > 0 else None
 
 def kelly_fraction(p: float, b: float = 1.0) -> float:
-    """
-    Kelly para odds 1:1 (jogo par). Limita a 0..1 por segurança.
-    """
+    """Kelly para odds 1:1."""
     q = 1 - p
     f = (b*p - q) / b
     return max(0.0, min(1.0, f))
 
 def advisor_suggestion(p: Profile) -> str:
-    """
-    Escolhe Dragon/Tiger pela maior prob. Se p<=0.5, recomenda não apostar.
-    Sugere stake pelo Kelly em cima da banca.
-    """
     m_best, prob = max([(m, p.probs.get(m,0.5)) for m in ("dragon","tiger")], key=lambda x: x[1])
     f = kelly_fraction(prob, b=1.0)
     if prob <= 0.5 or f <= 0:
@@ -90,7 +89,7 @@ def advisor_suggestion(p: Profile) -> str:
         f"Use /bet <stake> <dragon|tiger|tie> e feche com /result win|lose|push."
     )
 
-# =================== Handlers ===================
+# ----------------- HANDLERS -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     prof = Profile.load(uid); prof.save(uid)
@@ -110,7 +109,23 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stats\n"
         "/reset\n"
         "/auto_on <min>  — envia sugestões automáticas a cada X minutos\n"
-        "/auto_off       — desativa envio automático"
+        "/auto_off       — desativa envio automático\n"
+        "/ping           — teste de vida\n"
+        "/debug          — mostra configurações"
+    )
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong ✅")
+
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id; p = Profile.load(uid)
+    d = p.probs
+    await update.message.reply_text(
+        "⚙️ Config atual:\n"
+        f"Banca: {fmt(p.bankroll)} | SL {fmt(p.stop_loss)} | TP {fmt(p.stop_win)}\n"
+        f"Cooldown: {p.cooldown_min} min | Auto: {p.auto_enabled} / {p.auto_interval_min} min\n"
+        f"Prob: DR {d['dragon']:.3f} | TG {d['tiger']:.3f} | TIE {d['tie']:.3f}\n"
+        f"Apostas (sessão): {len([b for b in p.bets if b.pnl is not None])}"
     )
 
 async def setbankroll(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -246,7 +261,7 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p.session_start = time.time(); p.bets = []; p.save(uid)
     await update.message.reply_text("Sessão reiniciada.")
 
-# =================== AUTO (JobQueue) ===================
+# ----------------- AUTO (JobQueue) -----------------
 def _cancel_jobs_for(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     jq = getattr(context, "job_queue", None)
     if not jq:
@@ -256,7 +271,7 @@ def _cancel_jobs_for(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 async def auto_tick(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
-    uid = chat_id  # 1:1 sala privada
+    uid = chat_id  # conversa 1:1
     p = Profile.load(uid)
     rem = ensure_cooldown(p)
     pnl_s = session_pnl(p)
@@ -268,7 +283,6 @@ async def auto_tick(context: ContextTypes.DEFAULT_TYPE):
         _cancel_jobs_for(chat_id, context); p.auto_enabled = False; p.save(uid); return
     if rem:
         return
-    # envia sugestão real
     await context.bot.send_message(chat_id, advisor_suggestion(p))
 
 async def auto_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -284,7 +298,7 @@ async def auto_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p.auto_enabled = True; p.auto_interval_min = minutes; p.save(uid)
     _cancel_jobs_for(chat_id, context)
 
-    jq = context.job_queue  # <— usa o job_queue correto (evita NoneType)
+    jq = context.job_queue
     jq.run_repeating(
         auto_tick, interval=minutes*60, first=0, chat_id=chat_id, name=f"auto-{chat_id}"
     )
@@ -297,12 +311,21 @@ async def auto_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p = Profile.load(uid); p.auto_enabled = False; p.save(uid)
     await update.message.reply_text("🔕 Auto desligado.")
 
-async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Não reconheço esse comando. Use /help.")
+# ----------------- ERROR HANDLER -----------------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled error", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⚠️ Erro: {type(context.error).__name__}"
+            )
+    except Exception:
+        pass
 
-# =================== Main ===================
+# ----------------- MAIN -----------------
 async def post_init(application: Application):
-    # limpa qualquer webhook antigo para evitar conflito com polling
+    # evita conflito: garante que não há webhook pendente
     await application.bot.delete_webhook(drop_pending_updates=True)
 
 def main():
@@ -310,10 +333,13 @@ def main():
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN não definido. Configure no Render (Environment).")
+
     app = ApplicationBuilder().token(token).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CommandHandler("debug", debug))
     app.add_handler(CommandHandler("setbankroll", setbankroll))
     app.add_handler(CommandHandler("setlimits", setlimits))
     app.add_handler(CommandHandler("cooldown", cooldown))
@@ -326,9 +352,10 @@ def main():
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("auto_on", auto_on))
     app.add_handler(CommandHandler("auto_off", auto_off))
-    app.add_handler(MessageHandler(filters.COMMAND, fallback))
+    app.add_handler(MessageHandler(filters.COMMAND, help_cmd))
+    app.add_error_handler(on_error)
 
-    print("Bot a correr (Render) com auto_on/auto_off. Limpando webhooks e iniciando polling…")
+    log.info("Bot a correr…")
     app.run_polling(close_loop=False, drop_pending_updates=True)
 
 if __name__ == "__main__":
